@@ -1,0 +1,14 @@
+##################################
+# Proyecto : configuracion Hyprland
+# Proposito: Definir los archivos y carpetas que Git ignorara
+# funcionalidad: Evita el rastreo de archivos de prueba o locales
+
+### ---Archivos temporales de editor--###
+*.swp
+*.swo
+
+## ----- Backups Locales ------###
+respaldos/
+
+### ---- Control de enlaces simbolicos ----
+monitors.conf
