@@ -2,7 +2,7 @@
 # =============================================================================
 # wallpaper_picker_gui.py
 # Autor: Pablo
-# Última revisión: v4 (final)
+# Última revisión: v5 (Matugen Edition)
 #
 # PROPÓSITO:
 #   Selector visual de fondos de pantalla para Hyprland.
@@ -10,32 +10,19 @@
 #   Diseñado para 0% CPU en reposo — usa hyprpaper como backend permanente
 #   y swww SOLO durante la transición, luego lo destruye.
 #
-# ARQUITECTURA "SÁNDWICH":
-#   1. swww-daemon arranca y copia el fondo actual (invisible para el usuario).
+# ARQUITECTURA "SÁNDWICH" + MATUGEN:
+#   1. swww-daemon arranca y copia el fondo actual.
 #   2. swww anima la transición al nuevo fondo (capa superior, 60fps).
-#   3. hyprpaper carga el nuevo fondo por debajo en silencio.
-#   4. swww-daemon muere → hyprpaper queda expuesto con la imagen ya puesta.
-#   Resultado: animación fluida + 0% CPU en reposo (sin daemon swww activo).
+#   3. EN PARALELO: Matugen procesa la miniatura y genera una paleta de colores,
+#      recargando Hyprland al instante para colorear los bordes dinámicamente.
+#   4. hyprpaper carga el nuevo fondo por debajo en silencio.
+#   5. swww-daemon muere → hyprpaper queda expuesto con la imagen ya puesta.
 #
 # HISTORIAL DE FIXES:
-#   v1 (original):
-#     - Funcional pero con fugas de hilos, sleeps bloqueantes en GTK.
-#   v2 (fixes de arquitectura):
-#     [F1] executor.shutdown() en destroy → sin hilos zombi al cerrar.
-#     [F2] Bandera self._cancelled → los workers no tocan widgets destruidos.
-#     [F3] _sandwich_worker en hilo separado → sin bloqueo del event loop GTK.
-#     [F4] Un único Gtk.main_quit() via GLib.idle_add → sin race condition.
-#     [F5] Pango.EllipsizeMode.END → sin magia numérica en set_ellipsize.
-#     [F6] Polling de swww-daemon → sin sleep fijo de arranque.
-#     [F7] "unload unused" → no destruye wallpapers de otros monitores.
-#   v3 (fixes visuales):
-#     [F8] hyprctl listactive como fuente primaria del fondo actual.
-#     [F9] --transition-type none en PASO 2 → elimina artefacto visual inicial.
-#     [F10] shutil.rmtree del caché de swww movido DENTRO del arranque.
-#   v4 (esta versión, final):
-#     [F11] Fallback robusto: listactive → hyprpaper.conf → None.
-#     [F12] Parsing de listactive prioriza el monitor principal (eDP).
-#     [F13] Documentación completa de cada paso del sándwich.
+#   v1 a v3: Fixes visuales, hilos zombis y polling (ver repositorio).
+#   v4: Fallback robusto y parsing de listactive.
+#   v5: Integración nativa con Matugen usando hashes SHA-1 compartidos
+#       para extraer colores desde la caché sin estrés de CPU.
 # =============================================================================
 
 import gi
@@ -138,9 +125,10 @@ def actualizar_config(img_path):
         print(f"[wallpaper_picker] Error escribiendo config: {e}")
 
 # =============================================================================
-# CACHÉ DE MINIATURAS
+# CACHÉ DE MINIATURAS (HASH SHA-1)
 # =============================================================================
 def thumb_cache_path(path, size):
+    # Usamos SHA-1 de forma unificada en todo el script para evitar conflictos
     h = hashlib.sha1(path.encode("utf-8")).hexdigest()
     return os.path.join(CACHE_DIR, f"{h}_{size}.png")
 
@@ -212,9 +200,9 @@ def obtener_fondo_actual():
     return None 
 
 # =============================================================================
-# WORKER DEL SÁNDWICH
+# WORKER DEL SÁNDWICH (AHORA CON MATUGEN INTEGRADO)
 # =============================================================================
-def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail): # <-- ¡Nuevo parámetro!
+def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail):
     daemon_ya_corria = True
     try:
         subprocess.run(
@@ -253,7 +241,7 @@ def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail): # <-- ¡Nuevo pa
         )
         time.sleep(0.15) 
 
-    # 1. Inicia la animación de swww (Popen no detiene el código, se ejecuta en fondo)
+    # 1. Inicia la animación visual con swww (en segundo plano)
     subprocess.Popen([
         "swww", "img", ruta_nueva,
         "--transition-type",     "center",
@@ -262,16 +250,17 @@ def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail): # <-- ¡Nuevo pa
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # ==========================================================
-    # 2. INYECCIÓN MATUGEN: Generar colores concurrentemente
+    # 2. INYECCIÓN MATUGEN: Extracción y aplicación de colores
     # ==========================================================
-    # Mientras la animación de 1.5s ocurre, Matugen hace su magia
+    # Mientras transcurren los 1.5s de la animación swww, Matugen actúa
     if ruta_thumbnail and os.path.exists(ruta_thumbnail):
+        # Ejecuta Matugen en modo silencioso tomando el color más dominante (index 0)
         subprocess.run([
             "matugen", "image", ruta_thumbnail, 
             "--source-color-index", "0", "-q"
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # Recargar Hyprland al instante para inyectar los nuevos bordes
+        # Recarga Hyprland instantáneamente para pintar los bordes de la UI
         subprocess.run([
             "hyprctl", "reload"
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -279,10 +268,10 @@ def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail): # <-- ¡Nuevo pa
         print(f"Advertencia: No se encontró el thumbnail para Matugen: {ruta_thumbnail}")
     # ==========================================================
 
-    # 3. Esperar a que la transición de swww termine de forma segura
+    # 3. Espera a que termine la animación de swww
     time.sleep(1.7)
 
-    # 4. Pasar el control definitivo a Hyprpaper (Tu lógica original)
+    # 4. Traspasa el control definitivo a Hyprpaper (Bajo consumo)
     subprocess.run(
         ["hyprctl", "hyprpaper", "preload", ruta_nueva],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -434,10 +423,9 @@ class WallpaperBar(Gtk.Window):
         ruta_nueva   = self.items[self.seleccionado].ruta
         current_wall = obtener_fondo_actual()
 
-        # calculamos el MD5 de la ruta original para hallar la miniatura 
-        # que se pone a corde a la seleccion de la imagen en el menu de seleccion
-        hash_str = hashlib.md5(ruta_nueva.encode('utf-8')).hexdigest()
-        ruta_thumbnail = os.path.expanduser(f"~/.cache/wallpaper_picker/thumbnails/{hash_str}_160.png")
+        # Usamos tu propia función de caché (SHA-1) para garantizar que la ruta 
+        # enviada a Matugen sea exactamente la misma que la del thumbnail generado
+        ruta_thumbnail = thumb_cache_path(ruta_nueva, THUMBNAIL_SIZE)
 
         self.destroy()
 
