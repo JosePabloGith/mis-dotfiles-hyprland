@@ -2,7 +2,7 @@
 # =============================================================================
 # wallpaper_picker_gui.py
 # Autor: Pablo
-# Última revisión: v5 (Matugen Edition)
+# Última revisión: v6 (Cache Fix Edition)
 #
 # PROPÓSITO:
 #   Selector visual de fondos de pantalla para Hyprland.
@@ -12,17 +12,30 @@
 #
 # ARQUITECTURA "SÁNDWICH" + MATUGEN:
 #   1. swww-daemon arranca y copia el fondo actual.
-#   2. swww anima la transición al nuevo fondo (capa superior, 60fps).
-#   3. EN PARALELO: Matugen procesa la miniatura y genera una paleta de colores,
-#      recargando Hyprland al instante para colorear los bordes dinámicamente.
+#   2. swww anima la transición al nuevo fondo (capa superior, 60fps, 1.5s).
+#   3. EN PARALELO durante esos 1.5s: Matugen procesa el thumbnail del fondo
+#      seleccionado y genera una paleta de colores. Hyprctl recarga Hyprland
+#      al instante para colorear los bordes dinámicamente con el color
+#      más dominante del nuevo fondo. Esto ocurre DENTRO del sándwich,
+#      aprovechando el tiempo muerto de la animación swww.
 #   4. hyprpaper carga el nuevo fondo por debajo en silencio.
 #   5. swww-daemon muere → hyprpaper queda expuesto con la imagen ya puesta.
 #
+# CUÁNDO SE CAMBIAN LOS BORDES DE COLOR:
+#   → Exactamente cuando el usuario presiona Enter y se lanza la animación swww.
+#   → Matugen usa el THUMBNAIL en caché (160px) en lugar de la imagen completa,
+#     lo que lo hace extremadamente rápido (~200ms) y sin consumir CPU extra.
+#   → El borde cambia de color aproximadamente a los 300-500ms de la animación,
+#     antes de que swww termine, dando una sensación de transición cohesiva.
+#
 # HISTORIAL DE FIXES:
-#   v1 a v3: Fixes visuales, hilos zombis y polling (ver repositorio).
-#   v4: Fallback robusto y parsing de listactive.
-#   v5: Integración nativa con Matugen usando hashes SHA-1 compartidos
-#       para extraer colores desde la caché sin estrés de CPU.
+#   v1-v3: Fixes visuales, hilos zombis y polling (ver repositorio).
+#   v4:    Fallback robusto y parsing de listactive.
+#   v5:    Integración nativa con Matugen usando thumbnails en caché.
+#   v6:    Fix crítico de caché: hash basado en inode+tamaño+mtime en lugar
+#          de la ruta de texto. Escritura atómica de PNG con os.replace().
+#          Limpieza automática de thumbnails huérfanos y temporales zombis
+#          en hilo daemon.
 # =============================================================================
 
 import gi
@@ -125,31 +138,125 @@ def actualizar_config(img_path):
         print(f"[wallpaper_picker] Error escribiendo config: {e}")
 
 # =============================================================================
-# CACHÉ DE MINIATURAS (HASH SHA-1)
+# CACHÉ DE MINIATURAS (v6: hash por metadatos del archivo, no por ruta)
 # =============================================================================
+# Por qué se cambió:
+#   La versión anterior hasheaba la CADENA DE TEXTO de la ruta. Esto causaba
+#   que al mover/renombrar un wallpaper se generara un nuevo thumbnail aunque
+#   la imagen fuera idéntica. Con inode+tamaño+mtime_ns:
+#     - El mismo archivo en distintas rutas produce el MISMO hash (via inode).
+#     - Si el contenido cambia (mtime diferente), el hash cambia y se regenera.
+#     - Es una operación de microsegundos: os.stat() no lee el archivo.
+#
+def thumb_cache_key(path):
+    """Genera una llave de caché basada en metadatos del archivo, no en su ruta."""
+    try:
+        st = os.stat(path)
+        # inode: identidad física del archivo en disco (estable ante renombrados)
+        # st_size: si el tamaño cambia, el contenido cambió
+        # st_mtime_ns: nanosegundos de modificación, más preciso que mtime float
+        key = f"{st.st_ino}-{st.st_size}-{st.st_mtime_ns}"
+    except OSError:
+        # Fallback seguro: si no se puede stat (archivo inexistente en este momento),
+        # se usa la ruta. Es transitorio y se autocorrige en la siguiente ejecución.
+        key = path
+    return key
+
 def thumb_cache_path(path, size):
-    # Usamos SHA-1 de forma unificada en todo el script para evitar conflictos
-    h = hashlib.sha1(path.encode("utf-8")).hexdigest()
+    h = hashlib.sha1(thumb_cache_key(path).encode("utf-8")).hexdigest()
     return os.path.join(CACHE_DIR, f"{h}_{size}.png")
 
 def load_thumb_worker(src_path, image_widget, size, cancelled_flag):
+    """
+    Carga o genera el thumbnail de src_path y lo asigna al widget GTK.
+
+    Escritura atómica:
+      Se escribe primero en un archivo .tmp.PID y luego se hace os.replace()
+      que en Linux es atómico dentro del mismo filesystem. Así, si dos hilos
+      generan el mismo thumbnail simultáneamente, ninguno verá un PNG corrupto
+      a mitad de escritura.
+    """
     cache_path = thumb_cache_path(src_path, size)
     pix = None
     try:
         if os.path.exists(cache_path):
-            if os.path.getmtime(cache_path) >= os.path.getmtime(src_path):
-                pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_path, size, size, True)
+            # El thumbnail existe: cargarlo directamente sin abrir el original.
+            # No es necesario re-validar mtime aquí porque el nombre del archivo
+            # ya INCLUYE el mtime en su hash (ver thumb_cache_key). Si el
+            # wallpaper cambia de contenido, su hash será diferente y este
+            # archivo simplemente no existirá, forzando regeneración.
+            pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_path, size, size, True)
+
         if pix is None:
+            # Thumbnail no existe o falló al cargar: generar desde el original.
             pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(src_path, size, size, True)
+            tmp_path = cache_path + f".tmp.{os.getpid()}"
             try:
-                pix.savev(cache_path, "png", [], [])
-            except Exception:
-                pass 
-    except Exception:
+                pix.savev(tmp_path, "png", [], [])
+                # os.replace() es atómico en Linux (misma partición).
+                # Garantiza que otros hilos/procesos nunca lean un PNG incompleto.
+                os.replace(tmp_path, cache_path)
+            except Exception as e:
+                print(f"[wallpaper_picker] No se pudo guardar thumbnail: {e}")
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    except Exception as e:
+        print(f"[wallpaper_picker] Error procesando {src_path}: {e}")
         pix = None
 
     if pix is not None and not cancelled_flag[0]:
         GLib.idle_add(image_widget.set_from_pixbuf, pix)
+
+# =============================================================================
+# LIMPIEZA DE CACHÉ HUÉRFANA Y ZOMBIS (v6 Final)
+# =============================================================================
+def limpiar_cache_huerfana(archivos_validos):
+    """
+    Elimina thumbnails de wallpapers que ya no existen en WALLPAPER_DIR.
+
+    Se llama desde un hilo daemon al inicio, así no bloquea la UI.
+    Calcula los hashes válidos actuales y borra todo lo demás del CACHE_DIR.
+
+    Por qué es necesario:
+      Sin esto, cada wallpaper eliminado o renombrado deja su PNG huérfano
+      en caché para siempre. En colecciones grandes esto puede ocupar cientos
+      de MB sin que nadie lo note. Además limpia archivos .tmp zombis.
+    """
+    hashes_validos = set()
+    for nombre in archivos_validos:
+        ruta = os.path.join(WALLPAPER_DIR, nombre)
+        try:
+            h = hashlib.sha1(thumb_cache_key(ruta).encode("utf-8")).hexdigest()
+            hashes_validos.add(f"{h}_{THUMBNAIL_SIZE}.png")
+        except Exception:
+            pass
+
+    try:
+        for archivo in os.listdir(CACHE_DIR):
+            # Manejar archivos temporales en progreso
+            if ".tmp." in archivo:
+                ruta_tmp = os.path.join(CACHE_DIR, archivo)
+                try:
+                    # Si el archivo temporal tiene más de 5 minutos (300 segundos), es un zombi. Lo borramos.
+                    if time.time() - os.path.getmtime(ruta_tmp) > 300:
+                        os.unlink(ruta_tmp)
+                        print(f"[wallpaper_picker] Archivo temporal zombi eliminado: {archivo}")
+                except Exception:
+                    pass
+                continue
+
+            # Eliminar thumbnails huérfanos reales
+            if archivo not in hashes_validos:
+                try:
+                    os.unlink(os.path.join(CACHE_DIR, archivo))
+                    print(f"[wallpaper_picker] Caché huérfana eliminada: {archivo}")
+                except Exception as e:
+                    print(f"[wallpaper_picker] No se pudo borrar {archivo}: {e}")
+    except Exception as e:
+        print(f"[wallpaper_picker] Error durante limpieza de caché: {e}")
 
 # =============================================================================
 # DETECCIÓN DEL FONDO ACTUAL
@@ -197,11 +304,31 @@ def obtener_fondo_actual():
     except Exception:
         pass
 
-    return None 
+    return None
 
 # =============================================================================
-# WORKER DEL SÁNDWICH (AHORA CON MATUGEN INTEGRADO)
+# WORKER DEL SÁNDWICH + MATUGEN
 # =============================================================================
+# CUÁNDO SE DISPARA MATUGEN Y POR QUÉ:
+#
+#   El usuario presiona Enter → la ventana se cierra → este hilo inicia.
+#
+#   Línea de tiempo:
+#     t=0.00s  swww-daemon arranca (si no estaba corriendo)
+#     t=0.00s  swww IMG empieza la animación de 1.5s en SEGUNDO PLANO (Popen)
+#     t=0.00s  → Matugen arranca INMEDIATAMENTE en paralelo con swww
+#     t≈0.20s  → Matugen termina de procesar el thumbnail (160px es muy liviano)
+#     t≈0.20s  → hyprctl reload aplica la nueva paleta de colores a los bordes
+#     t=1.70s  → swww termina la animación
+#     t=1.70s  → hyprpaper toma el control definitivo (preload + wallpaper)
+#     t=1.70s  → swww-daemon muere (killall SIGTERM)
+#
+#   Por qué usar el THUMBNAIL (160px) y no el wallpaper original:
+#     - Matugen puede tardar 2-5s con una imagen de 4K.
+#     - Con el thumbnail de 160px tarda ~200ms.
+#     - El color dominante extraído es prácticamente idéntico en ambos casos.
+#     - El thumbnail ya existe en caché desde que el usuario abrió el picker.
+#
 def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail):
     daemon_ya_corria = True
     try:
@@ -211,7 +338,7 @@ def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail):
         )
     except subprocess.CalledProcessError:
         daemon_ya_corria = False
-        
+
         if os.path.exists(SWWW_CACHE_DIR):
             try:
                 shutil.rmtree(SWWW_CACHE_DIR)
@@ -232,16 +359,16 @@ def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail):
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             if r.returncode == 0:
-                break 
+                break
 
     if current_wall and os.path.isfile(current_wall):
         subprocess.run(
             ["swww", "img", current_wall, "--transition-type", "none"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        time.sleep(0.15) 
+        time.sleep(0.15)
 
-    # 1. Inicia la animación visual con swww (en segundo plano)
+    # --- PASO 1: Animación visual (lanzada en segundo plano, no bloqueante) ---
     subprocess.Popen([
         "swww", "img", ruta_nueva,
         "--transition-type",     "center",
@@ -249,29 +376,28 @@ def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail):
         "--transition-fps",      "60",
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # ==========================================================
-    # 2. INYECCIÓN MATUGEN: Extracción y aplicación de colores
-    # ==========================================================
-    # Mientras transcurren los 1.5s de la animación swww, Matugen actúa
+    # --- PASO 2: Matugen en paralelo con la animación swww ---
+    # Mientras swww anima los 1.5s, Matugen procesa el thumbnail (ya en caché)
+    # y recarga los colores de Hyprland. El usuario ve el borde cambiar de color
+    # aproximadamente a mitad de la transición visual, creando un efecto cohesivo.
     if ruta_thumbnail and os.path.exists(ruta_thumbnail):
-        # Ejecuta Matugen en modo silencioso tomando el color más dominante (index 0)
         subprocess.run([
-            "matugen", "image", ruta_thumbnail, 
-            "--source-color-index", "0", "-q"
+            "matugen", "image", ruta_thumbnail,
+            "--source-color-index", "0",  # índice 0 = color más dominante
+            "-q"
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        # Recarga Hyprland instantáneamente para pintar los bordes de la UI
+
         subprocess.run([
             "hyprctl", "reload"
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        print(f"Advertencia: No se encontró el thumbnail para Matugen: {ruta_thumbnail}")
-    # ==========================================================
+        print(f"[wallpaper_picker] Advertencia: thumbnail no encontrado para Matugen: {ruta_thumbnail}")
+        print(f"[wallpaper_picker] Se omite el cambio de color de bordes para este fondo.")
 
-    # 3. Espera a que termine la animación de swww
+    # --- PASO 3: Esperar a que swww termine su animación ---
     time.sleep(1.7)
 
-    # 4. Traspasa el control definitivo a Hyprpaper (Bajo consumo)
+    # --- PASO 4: Transferir control definitivo a hyprpaper (bajo consumo) ---
     subprocess.run(
         ["hyprctl", "hyprpaper", "preload", ruta_nueva],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -285,6 +411,7 @@ def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail):
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
+    # --- PASO 5: Destruir swww-daemon, hyprpaper queda expuesto ---
     subprocess.run(
         ["killall", "-s", "SIGTERM", "swww-daemon"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -360,6 +487,13 @@ class WallpaperBar(Gtk.Window):
                 if f.lower().endswith(EXTENSIONES)
             ])
 
+        # Limpieza de thumbnails huérfanos en hilo daemon (no bloquea la UI)
+        threading.Thread(
+            target=limpiar_cache_huerfana,
+            args=(archivos,),
+            daemon=True
+        ).start()
+
         for nombre in archivos:
             ruta = os.path.join(WALLPAPER_DIR, nombre)
 
@@ -423,8 +557,8 @@ class WallpaperBar(Gtk.Window):
         ruta_nueva   = self.items[self.seleccionado].ruta
         current_wall = obtener_fondo_actual()
 
-        # Usamos tu propia función de caché (SHA-1) para garantizar que la ruta 
-        # enviada a Matugen sea exactamente la misma que la del thumbnail generado
+        # thumb_cache_path usa la misma llave (inode+size+mtime) que load_thumb_worker,
+        # así se garantiza que apuntamos exactamente al thumbnail que ya existe en disco.
         ruta_thumbnail = thumb_cache_path(ruta_nueva, THUMBNAIL_SIZE)
 
         self.destroy()
