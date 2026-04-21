@@ -214,7 +214,7 @@ def obtener_fondo_actual():
 # =============================================================================
 # WORKER DEL SÁNDWICH
 # =============================================================================
-def _sandwich_worker(ruta_nueva, current_wall):
+def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail): # <-- ¡Nuevo parámetro!
     daemon_ya_corria = True
     try:
         subprocess.run(
@@ -253,6 +253,7 @@ def _sandwich_worker(ruta_nueva, current_wall):
         )
         time.sleep(0.15) 
 
+    # 1. Inicia la animación de swww (Popen no detiene el código, se ejecuta en fondo)
     subprocess.Popen([
         "swww", "img", ruta_nueva,
         "--transition-type",     "center",
@@ -260,8 +261,28 @@ def _sandwich_worker(ruta_nueva, current_wall):
         "--transition-fps",      "60",
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    # ==========================================================
+    # 2. INYECCIÓN MATUGEN: Generar colores concurrentemente
+    # ==========================================================
+    # Mientras la animación de 1.5s ocurre, Matugen hace su magia
+    if ruta_thumbnail and os.path.exists(ruta_thumbnail):
+        subprocess.run([
+            "matugen", "image", ruta_thumbnail, 
+            "--source-color-index", "0", "-q"
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # Recargar Hyprland al instante para inyectar los nuevos bordes
+        subprocess.run([
+            "hyprctl", "reload"
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        print(f"Advertencia: No se encontró el thumbnail para Matugen: {ruta_thumbnail}")
+    # ==========================================================
+
+    # 3. Esperar a que la transición de swww termine de forma segura
     time.sleep(1.7)
 
+    # 4. Pasar el control definitivo a Hyprpaper (Tu lógica original)
     subprocess.run(
         ["hyprctl", "hyprpaper", "preload", ruta_nueva],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -413,11 +434,16 @@ class WallpaperBar(Gtk.Window):
         ruta_nueva   = self.items[self.seleccionado].ruta
         current_wall = obtener_fondo_actual()
 
+        # calculamos el MD5 de la ruta original para hallar la miniatura 
+        # que se pone a corde a la seleccion de la imagen en el menu de seleccion
+        hash_str = hashlib.md5(ruta_nueva.encode('utf-8')).hexdigest()
+        ruta_thumbnail = os.path.expanduser(f"~/.cache/wallpaper_picker/thumbnails/{hash_str}_160.png")
+
         self.destroy()
 
         threading.Thread(
             target=_sandwich_worker,
-            args=(ruta_nueva, current_wall),
+            args=(ruta_nueva, current_wall, ruta_thumbnail),
             daemon=True
         ).start()
 
