@@ -145,7 +145,8 @@ def actualizar_config(img_path):
         "splash = false\n"
         "ipc = true\n"
         f"preload = {img_path}\n"
-        f"wallpaper = ,{img_path}\n"
+        f"wallpaper = eDP-1,{img_path}\n"
+        f"wallpaper = HDMI-A-1,{img_path}\n"
     )
     try:
         with open(HYPRPAPER_CONF, 'w') as f:
