@@ -2,7 +2,7 @@
 # =============================================================================
 # wallpaper_picker_gui.py
 # Autor: Pablo (Asistido por HyprGem)
-# Última revisión: v15 (Enterprise Grade Edition)
+# Última revisión: v18 (IPC Discovery Edition)
 #
 # PROPÓSITO:
 #   Selector visual de fondos de pantalla para Hyprland.
@@ -10,40 +10,82 @@
 #   Diseñado para 0% CPU en reposo — usa hyprpaper como backend permanente
 #   y swww SOLO durante la transición, luego lo destruye.
 #
+# ENTORNO DE PRODUCCIÓN:
+#   - Ubuntu 24 LTS + Hyprland 0.54.3 + hyprpaper 0.8.3
+#   - AMD Ryzen 7 5700U (iGPU Lucienne) — renderizado Wayland puro
+#
 # ARQUITECTURA "SÁNDWICH" + MATUGEN + THREAD-SAFETY:
-#   1. swww-daemon arranca y copia el fondo actual.
-#   2. swww anima la transición al nuevo fondo (capa superior, 60fps, 1.5s).
-#   3. EN PARALELO durante esos 1.5s: Matugen procesa el thumbnail en caché
+#   1. swww-daemon arranca (si no estaba corriendo).
+#   2. swww siembra el fondo actual (solo si el daemon ya existía — evita
+#      flash triple al primer uso tras reiniciar).
+#   3. swww anima la transición al nuevo fondo (center, 60fps, 1.5s).
+#   4. EN PARALELO durante esos 1.5s: Matugen procesa el thumbnail en caché
 #      (160px, ~200ms) y hyprctl recarga los bordes dinámicamente.
 #      El borde cambia de color aprox. a los 300-500ms de la animación,
 #      dando una sensación de transición fluida y cohesiva.
-#   4. hyprpaper carga el nuevo fondo por debajo en silencio.
-#   5. swww-daemon muere (solo si fue iniciado por el script) → hyprpaper queda expuesto.
+#   5. hyprctl hyprpaper preload + wallpaper informan a hyprpaper de la nueva
+#      imagen ANTES de que swww muera (ver nota de compatibilidad abajo).
+#   6. swww-daemon muere — su única función era la transición visual.
+#   7. actualizar_config() escribe el conf en disco para persistencia.
+#      hyprpaper queda como backend permanente con 0% CPU.
+#
+# NOTA DE COMPATIBILIDAD (hyprpaper 0.8.3 + Ubuntu 24):
+#   hyprpaper 0.8.3 instalado desde los repos de Ubuntu fue compilado sin
+#   soporte completo para los protocolos Wayland modernos de Hyprland 0.54.3.
+#   Esto causa que el comando 'listactive' falle con:
+#     "error: can't send: hyprpaper protocol version too low"
+#   SIN EMBARGO, los comandos de escritura 'preload' y 'wallpaper' SÍ
+#   funcionan correctamente — solo falla la lectura de estado.
+#
+#   Por este motivo:
+#     - obtener_fondo_actual() ignora el IPC y lee el conf directamente.
+#     - El sándwich usa 'preload' y 'wallpaper' via IPC (funcionan) para
+#       informar a hyprpaper ANTES de matar swww, garantizando el traspaso.
+#     - Al reiniciar el sistema, restore_wallpaper.sh replica este mismo
+#       truco: swww pinta → IPC informa a hyprpaper → swww muere.
+#
+# LÍNEA DE TIEMPO COMPLETA DEL SÁNDWICH:
+#   t=0.00s  swww-daemon arranca (si no corría)
+#   t=0.00s  siembra del fondo actual (SOLO si daemon ya corría)
+#   t=0.15s  swww img ruta_nueva --transition-type center (1.5s, Popen)
+#   t=0.15s  → Matugen procesa thumbnail (160px, ~200ms) EN PARALELO
+#   t=0.35s  → hyprctl reload aplica nueva paleta de colores a los bordes
+#   t=1.85s  swww termina su animación
+#   t=1.85s  hyprctl hyprpaper preload ruta_nueva  ← hyprpaper carga imagen
+#   t=1.85s  hyprctl hyprpaper wallpaper ,ruta_nueva ← hyprpaper la registra
+#   t=1.85s  hyprctl hyprpaper unload unused ← limpieza de memoria
+#   t=1.85s  swww-daemon muere (SIEMPRE — solo vivió para la transición)
+#   t=1.85s  actualizar_config() escribe conf en disco
+#            → hyprpaper queda expuesto con la imagen correcta ✅
 #
 # HISTORIAL DE FIXES Y AUDITORÍAS:
 #   v1-v5:   Fixes visuales, fallback robusto e integración nativa con Matugen.
-#   v6:      Caché inteligente (inode+tamaño+mtime) y limpieza de archivos huérfanos.
-#   v7-v8:   Protección RAM/CPU (Locks por archivo) y Anti-Zombis (Short-circuit).
-#   v9-v10:  Protección SSD (sin rmtree) y respeto de demonios (daemon_ya_corria).
-#   v11-v13: Consolidación de Arquitectura Sándwich (swww + matugen + hyprpaper).
-#   v14-v15: Clean Code, prevención de deadlocks en D-Bus (Popen) y limpieza de hilos.
-#   v16:     Generación Just-In-Time (JIT) de thumbnails para usuarios muy rápidos.
+#   v6:      Caché inteligente (inode+tamaño+mtime) y limpieza de huérfanos.
+#   v7-v8:   Locks por archivo (anti race-condition) y Short-circuit (anti zombi).
+#   v9-v10:  Protección SSD (sin rmtree) y respeto de demonios preexistentes.
+#   v11-v13: Consolidación de Arquitectura Sándwich.
+#   v14-v15: Clean Code, Popen para D-Bus (anti deadlock), executor local.
+#   v16:     Generación JIT de thumbnails para usuarios muy rápidos.
+#   v17:     Fix cosmético: siembra solo si daemon_ya_corria (sin flash triple).
+#   v18:     Descubrimiento IPC: listactive roto pero preload/wallpaper OK.
+#            obtener_fondo_actual() simplificada (solo lee conf en disco).
+#            _thumb_locks.clear() en _on_destroy (fix de leak de RAM menor).
+#            swww-daemon ahora SIEMPRE muere al final del sándwich.
 # =============================================================================
-
+ 
 import gi
 import os
 import subprocess
 import hashlib
 import time
 import threading
-import shutil
 from concurrent.futures import ThreadPoolExecutor
-
+ 
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 gi.require_version('Pango', '1.0')
 from gi.repository import Gtk, GdkPixbuf, Gdk, GLib, Pango
-
+ 
 # =============================================================================
 # CONFIGURACIÓN
 # =============================================================================
@@ -54,38 +96,49 @@ ALTURA_BARRA   = 220
 CACHE_DIR      = os.path.expanduser("~/.cache/wallpaper_picker/thumbnails")
 THUMB_WORKERS  = 4
 HYPRPAPER_CONF = os.path.expanduser("~/.config/hypr/hyprpaper.conf")
-SWWW_CACHE_DIR = os.path.expanduser("~/.cache/swww")
-
+ 
 SWWW_TIMEOUT   = 2.0
 SWWW_POLL_MS   = 0.1
-
+ 
 DEBUG_MODE     = False  # Cambia a True solo cuando estés desarrollando/probando
-
+ 
 os.makedirs(CACHE_DIR, exist_ok=True)
-
-# --- SISTEMA DE NOTIFICACIONES LIGERAS ---
+ 
+# =============================================================================
+# SISTEMA DE NOTIFICACIONES LIGERAS
+# =============================================================================
 def notificar_error(mensaje):
-    """Muestra un error en pantalla (Wayland nativo) sin usar el disco duro para logs."""
+    """
+    Muestra un error en pantalla (Wayland nativo) sin bloquear hilos.
+    Popen (fire-and-forget): evita que un D-Bus lento bloquee los locks
+    de memoria. Solo activo con DEBUG_MODE=True.
+    """
     if DEBUG_MODE:
         try:
-            # Fix: Usar Popen (fire-and-forget) evita que un D-Bus lento bloquee los locks de memoria
             subprocess.Popen(
                 ["notify-send", "-u", "critical", "Wallpaper Picker", mensaje],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
         except Exception:
             pass
-
-# --- SISTEMA DE BLOQUEO DE HILOS ---
+ 
+# =============================================================================
+# SISTEMA DE BLOQUEO DE HILOS (anti race-condition por archivo)
+# =============================================================================
 _thumb_locks = {}
 _locks_mutex = threading.Lock()
-
+ 
 def get_lock_for(key):
+    """
+    Devuelve un Lock exclusivo por archivo (basado en su cache_key).
+    Previene que dos hilos generen el mismo thumbnail simultáneamente,
+    lo que podría producir PNGs corruptos o trabajo duplicado.
+    """
     with _locks_mutex:
         if key not in _thumb_locks:
             _thumb_locks[key] = threading.Lock()
         return _thumb_locks[key]
-
+ 
 # =============================================================================
 # CSS
 # =============================================================================
@@ -97,7 +150,7 @@ window {
 }
 scrolledwindow { background-color: transparent; }
 viewport       { background-color: transparent; }
-
+ 
 #contenedor {
     background-color: transparent;
     padding: 12px 16px;
@@ -136,11 +189,16 @@ viewport       { background-color: transparent; }
     padding-top: 4px;
 }
 """
-
+ 
 # =============================================================================
 # PERSISTENCIA
 # =============================================================================
 def actualizar_config(img_path):
+    """
+    Escribe hyprpaper.conf con monitores explícitos.
+    Este archivo es leído por restore_wallpaper.sh al reiniciar el sistema
+    para saber qué imagen restaurar, y por hyprpaper al arrancar.
+    """
     contenido = (
         "splash = false\n"
         "ipc = true\n"
@@ -154,49 +212,62 @@ def actualizar_config(img_path):
     except Exception as e:
         if DEBUG_MODE:
             print(f"[wallpaper_picker] Error escribiendo config: {e}")
-
+ 
 # =============================================================================
 # CACHÉ DE MINIATURAS
 # =============================================================================
 def thumb_cache_key(path):
+    """
+    Genera una llave de caché basada en metadatos del archivo, no en su ruta.
+    inode+tamaño+mtime_ns: estable ante renombrados, sensible a cambios
+    de contenido. Es una operación de microsegundos (os.stat, sin leer disco).
+    """
     try:
         st = os.stat(path)
         key = f"{st.st_ino}-{st.st_size}-{st.st_mtime_ns}"
     except OSError:
-        key = path
+        key = path  # Fallback seguro si el archivo no existe en este momento
     return key
-
+ 
 def thumb_cache_path(path, size):
     h = hashlib.sha1(thumb_cache_key(path).encode("utf-8")).hexdigest()
     return os.path.join(CACHE_DIR, f"{h}_{size}.png")
-
+ 
 def load_thumb_worker(src_path, image_widget, size, cancelled_flag):
-    """Carga o genera el thumbnail protegiendo RAM y CPU."""
-    # Short-circuit: Si se canceló la UI, muere inmediatamente sin consumir CPU.
+    """
+    Carga o genera el thumbnail protegiendo RAM y CPU.
+ 
+    Protecciones activas:
+      - Short-circuit: 3 puntos de chequeo de cancelled_flag antes de
+        operaciones costosas (lock, carga de imagen original).
+      - Lock por archivo: garantiza exclusividad — nunca dos hilos generan
+        el mismo PNG simultáneamente.
+      - Escritura atómica: .tmp + os.replace() — nunca se lee un PNG
+        a mitad de escritura.
+    """
     if cancelled_flag[0]:
         return
-
-    cache_key = thumb_cache_key(src_path)
+ 
+    cache_key  = thumb_cache_key(src_path)
     cache_path = thumb_cache_path(src_path, size)
-    lock = get_lock_for(cache_key)
-    pix = None
-
+    lock       = get_lock_for(cache_key)
+    pix        = None
+ 
     with lock:
         if cancelled_flag[0]:
             return
-
+ 
         try:
             if os.path.exists(cache_path):
                 pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(cache_path, size, size, True)
-
+ 
             if pix is None:
                 if cancelled_flag[0]:
                     return
-                
-                pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(src_path, size, size, True)
-                # Fix: Eliminado threading.get_ident() por ser redundante (el lock garantiza exclusividad)
+ 
+                pix      = GdkPixbuf.Pixbuf.new_from_file_at_scale(src_path, size, size, True)
                 tmp_path = cache_path + f".tmp.{os.getpid()}"
-                
+ 
                 try:
                     pix.savev(tmp_path, "png", [], [])
                     os.replace(tmp_path, cache_path)
@@ -208,20 +279,25 @@ def load_thumb_worker(src_path, image_widget, size, cancelled_flag):
                             os.unlink(tmp_path)
                     except Exception:
                         pass
-
+ 
         except Exception as e:
             if DEBUG_MODE:
                 print(f"[wallpaper_picker] ERROR PROCESANDO {src_path}: {e}")
                 notificar_error(f"Imagen corrupta o ilegible:\n{os.path.basename(src_path)}")
             pix = None
-
+ 
     if pix is not None and not cancelled_flag[0]:
         GLib.idle_add(image_widget.set_from_pixbuf, pix)
-
+ 
 # =============================================================================
 # LIMPIEZA DE CACHÉ HUÉRFANA Y ZOMBIS
 # =============================================================================
 def limpiar_cache_huerfana(archivos_validos):
+    """
+    Elimina thumbnails de wallpapers que ya no existen en WALLPAPER_DIR.
+    Se llama desde un hilo daemon al inicio — no bloquea la UI.
+    También limpia archivos .tmp zombis con más de 5 minutos de antigüedad.
+    """
     hashes_validos = set()
     for nombre in archivos_validos:
         ruta = os.path.join(WALLPAPER_DIR, nombre)
@@ -230,7 +306,7 @@ def limpiar_cache_huerfana(archivos_validos):
             hashes_validos.add(f"{h}_{THUMBNAIL_SIZE}.png")
         except Exception:
             pass
-
+ 
     try:
         for archivo in os.listdir(CACHE_DIR):
             if ".tmp." in archivo:
@@ -241,7 +317,7 @@ def limpiar_cache_huerfana(archivos_validos):
                 except Exception:
                     pass
                 continue
-
+ 
             if archivo not in hashes_validos:
                 try:
                     os.unlink(os.path.join(CACHE_DIR, archivo))
@@ -250,37 +326,22 @@ def limpiar_cache_huerfana(archivos_validos):
     except Exception as e:
         if DEBUG_MODE:
             print(f"[wallpaper_picker] Error durante limpieza de caché: {e}")
-
+ 
 # =============================================================================
 # DETECCIÓN DEL FONDO ACTUAL
 # =============================================================================
 def obtener_fondo_actual():
-    try:
-        salida = subprocess.check_output(
-            ["hyprctl", "hyprpaper", "listactive"],
-            text=True, timeout=2
-        )
-        lineas = [l for l in salida.splitlines() if "=" in l]
-
-        candidato_principal = None
-        candidato_fallback  = None
-
-        for linea in lineas:
-            monitor, _, ruta = linea.partition("=")
-            ruta = ruta.strip()
-            if os.path.isfile(ruta):
-                if candidato_fallback is None:
-                    candidato_fallback = ruta
-                if "eDP" in monitor:
-                    candidato_principal = ruta
-                    break
-
-        resultado = candidato_principal or candidato_fallback
-        if resultado:
-            return resultado
-    except Exception:
-        pass
-
+    """
+    Lee el wallpaper activo directamente desde el conf en disco.
+ 
+    Por qué NO se usa 'hyprctl hyprpaper listactive':
+      En Ubuntu 24 + Hyprland 0.54.3, hyprpaper 0.8.3 fue compilado sin
+      soporte para el protocolo IPC moderno. El comando listactive falla con
+      "protocol version too low". Los comandos de escritura (preload,
+      wallpaper) SÍ funcionan — solo falla la lectura de estado.
+      Leer el conf directamente es más robusto y compatible con cualquier
+      versión de hyprpaper.
+    """
     try:
         with open(HYPRPAPER_CONF) as f:
             for linea in f:
@@ -296,13 +357,15 @@ def obtener_fondo_actual():
                         return ruta
     except Exception:
         pass
-
+ 
     return None
-
+ 
 # =============================================================================
 # WORKER DEL SÁNDWICH + MATUGEN
 # =============================================================================
 def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail):
+ 
+    # ── PASO 1: Asegurar que swww-daemon esté corriendo ──────────────────────
     daemon_ya_corria = True
     try:
         subprocess.run(
@@ -311,16 +374,12 @@ def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail):
         )
     except subprocess.CalledProcessError:
         daemon_ya_corria = False
-
-        # Protección SSD: NO borrar el directorio masivamente con rmtree.
-        # En su lugar, dejamos que el demonio maneje su propia memoria/caché.
-        # Es mejor no tocar el disco duro innecesariamente.
-
+ 
         subprocess.Popen(
             ["swww-daemon"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-
+ 
         transcurrido = 0.0
         while transcurrido < SWWW_TIMEOUT:
             time.sleep(SWWW_POLL_MS)
@@ -331,50 +390,67 @@ def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail):
             )
             if r.returncode == 0:
                 break
-
-    if current_wall and os.path.isfile(current_wall):
+ 
+    # ── PASO 2: Sembrar fondo actual (solo si daemon ya existía) ─────────────
+    # Si lo acabamos de arrancar, hyprpaper sigue activo visualmente por debajo
+    # y la siembra añadiría un flash innecesario antes de la animación.
+    if daemon_ya_corria and current_wall and os.path.isfile(current_wall):
         subprocess.run(
             ["swww", "img", current_wall, "--transition-type", "none"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         time.sleep(0.15)
-
+ 
+    # ── PASO 3: Animación visual (Popen — no bloqueante) ─────────────────────
     subprocess.Popen([
         "swww", "img", ruta_nueva,
         "--transition-type",     "center",
         "--transition-duration", "1.5",
         "--transition-fps",      "60",
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # Fallback JIT (v16): Si el usuario aplicó el fondo rápido antes de que el worker lo procesara
+ 
+    # ── PASO 4: Matugen en paralelo con la animación ──────────────────────────
+    # Fallback JIT: Si el usuario presionó Enter antes de que el worker
+    # de thumbnails terminara, generamos el thumbnail ahora mismo.
     if ruta_thumbnail and not os.path.exists(ruta_thumbnail):
         try:
-            pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(ruta_nueva, THUMBNAIL_SIZE, THUMBNAIL_SIZE, True)
+            pix      = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                           ruta_nueva, THUMBNAIL_SIZE, THUMBNAIL_SIZE, True)
             tmp_path = ruta_thumbnail + f".tmp.{os.getpid()}"
             pix.savev(tmp_path, "png", [], [])
             os.replace(tmp_path, ruta_thumbnail)
         except Exception:
             pass
-
+ 
     if ruta_thumbnail and os.path.exists(ruta_thumbnail):
         r = subprocess.run([
             "matugen", "image", ruta_thumbnail,
             "--source-color-index", "0",
             "-q"
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
+ 
         if r.returncode != 0 and DEBUG_MODE:
             notificar_error("Matugen falló al extraer colores del thumbnail.")
-
-        subprocess.run([
-            "hyprctl", "reload"
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+ 
+        subprocess.run(
+            ["hyprctl", "reload"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
     else:
         if DEBUG_MODE:
             notificar_error("Thumbnail no encontrado. Se omitió la recarga de colores.")
-
+ 
+    # ── PASO 5: Esperar fin de animación swww ─────────────────────────────────
     time.sleep(1.7)
-
+ 
+    # ── PASO 6: Informar a hyprpaper ANTES de matar swww ─────────────────────
+    # CRÍTICO: hyprpaper debe recibir la nueva imagen via IPC mientras swww
+    # sigue activo como cortina visual. Si matamos swww antes de este paso,
+    # hyprpaper queda expuesto sin imagen → fondo genérico de Hyprland.
+    #
+    # Nota de compatibilidad (v18):
+    #   'listactive' falla con "protocol version too low" en hyprpaper 0.8.3
+    #   compilado para Ubuntu 24, pero 'preload' y 'wallpaper' SÍ funcionan.
     subprocess.run(
         ["hyprctl", "hyprpaper", "preload", ruta_nueva],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -387,35 +463,40 @@ def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail):
         ["hyprctl", "hyprpaper", "unload", "unused"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-
-    # Control de demonio: Respetamos el proceso si no lo abrimos nosotros.
-    if not daemon_ya_corria:
-        subprocess.run(
-            ["killall", "-s", "SIGTERM", "swww-daemon"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-    elif DEBUG_MODE:
-        print("[wallpaper_picker] swww-daemon ya corría previamente. No se cerrará.")
-
+ 
+    # ── PASO 7: swww muere — su única función era la transición ──────────────
+    subprocess.run(
+        ["killall", "-s", "SIGTERM", "swww-daemon"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+ 
+    # ── PASO 8: Persistencia en disco ────────────────────────────────────────
+    # Escribe el conf para que restore_wallpaper.sh sepa qué imagen restaurar
+    # al próximo reinicio del sistema.
     actualizar_config(ruta_nueva)
+ 
+    if DEBUG_MODE:
+        print(f"[wallpaper_picker] Sándwich completado. hyprpaper activo con: {ruta_nueva}")
+ 
     GLib.idle_add(Gtk.main_quit)
-
+ 
 # =============================================================================
 # VENTANA PRINCIPAL
 # =============================================================================
 class WallpaperBar(Gtk.Window):
     def __init__(self):
         super().__init__(title="wallpaper_picker")
-
+ 
         self._cancelled = [False]
-        # El Executor es local a la instancia para evitar procesos zombis en RAM.
+        # Executor local a la instancia — su ciclo de vida está atado a la ventana.
+        # Evita workers zombis si se instancia la clase más de una vez.
         self.executor = ThreadPoolExecutor(max_workers=THUMB_WORKERS)
-
+ 
         self.set_decorated(False)
         self.set_keep_above(True)
         self.set_app_paintable(True)
         self.set_type_hint(Gdk.WindowTypeHint.DOCK)
-
+ 
         display = Gdk.Display.get_default()
         monitor = display.get_monitor(0)
         if monitor:
@@ -425,92 +506,96 @@ class WallpaperBar(Gtk.Window):
             y_pos = geo.y + geo.height - ALTURA_BARRA
         else:
             width, x_pos, y_pos = 1920, 0, 1080 - ALTURA_BARRA
-
+ 
         self.set_default_size(width, ALTURA_BARRA)
         self.move(x_pos, y_pos)
-
+ 
         screen = self.get_screen()
         visual = screen.get_rgba_visual()
         if visual:
             self.set_visual(visual)
-
+ 
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_screen(
             screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
-
+ 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.add(vbox)
-
+ 
         titulo = Gtk.Label(
             label="  Elige tu fondo  |  ← → navegar  |  Enter aplicar  |  Esc cerrar"
         )
         titulo.set_name("titulo")
         titulo.set_halign(Gtk.Align.START)
         vbox.pack_start(titulo, False, False, 0)
-
+ 
         self.scroll = Gtk.ScrolledWindow()
         self.scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
         self.scroll.set_min_content_height(ALTURA_BARRA - 40)
         vbox.pack_start(self.scroll, True, True, 0)
-
+ 
         contenedor = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         contenedor.set_name("contenedor")
         self.scroll.add(contenedor)
-
+ 
         self.items        = []
         self.seleccionado = 0
-
+ 
         archivos = []
         if os.path.exists(WALLPAPER_DIR):
             archivos = sorted([
                 f for f in os.listdir(WALLPAPER_DIR)
                 if f.lower().endswith(EXTENSIONES)
             ])
-
+ 
+        # Limpieza de thumbnails huérfanos en hilo daemon — no bloquea la UI
         threading.Thread(
             target=limpiar_cache_huerfana,
             args=(archivos,),
             daemon=True
         ).start()
-
+ 
         for nombre in archivos:
             ruta = os.path.join(WALLPAPER_DIR, nombre)
-
+ 
             vbox_item = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             vbox_item.get_style_context().add_class("thumb-box")
             vbox_item.ruta   = ruta
             vbox_item.nombre = nombre
-
+ 
             imagen = Gtk.Image()
             imagen.set_size_request(THUMBNAIL_SIZE, THUMBNAIL_SIZE)
-
+ 
             label = Gtk.Label(label=nombre)
             label.get_style_context().add_class("thumb-label")
             label.set_max_width_chars(18)
             label.set_ellipsize(Pango.EllipsizeMode.END)
-
+ 
             vbox_item.pack_start(imagen, False, False, 0)
             vbox_item.pack_start(label,  False, False, 0)
             vbox_item.imagen_widget = imagen
             vbox_item.label_widget  = label
-
+ 
             contenedor.pack_start(vbox_item, False, False, 0)
             self.items.append(vbox_item)
-
+ 
             self.executor.submit(
                 load_thumb_worker, ruta, imagen, THUMBNAIL_SIZE, self._cancelled
             )
-
+ 
         self.actualizar_seleccion()
         self.connect("key-press-event", self.on_tecla)
         self.connect("destroy", self._on_destroy)
-
+ 
     def _on_destroy(self, *_):
         self._cancelled[0] = True
         self.executor.shutdown(wait=False, cancel_futures=True)
-
+        # Limpiar locks huérfanos — evita leak de RAM con colecciones grandes
+        with _locks_mutex:
+            _thumb_locks.clear()
+ 
     def actualizar_seleccion(self):
         for i, item in enumerate(self.items):
             ctx  = item.get_style_context()
@@ -522,7 +607,7 @@ class WallpaperBar(Gtk.Window):
                 ctx.remove_class("thumb-selected"); ctx.add_class("thumb-box")
                 lctx.remove_class("thumb-label-selected"); lctx.add_class("thumb-label")
         GLib.idle_add(self._scroll_to_selected)
-
+ 
     def _scroll_to_selected(self):
         if not self.items:
             return
@@ -530,23 +615,23 @@ class WallpaperBar(Gtk.Window):
         alloc = item.get_allocation()
         adj   = self.scroll.get_hadjustment()
         adj.set_value(alloc.x - (adj.get_page_size() / 2) + (alloc.width / 2))
-
+ 
     def aplicar_fondo(self):
         if not self.items:
             return
-
-        ruta_nueva   = self.items[self.seleccionado].ruta
-        current_wall = obtener_fondo_actual()
+ 
+        ruta_nueva     = self.items[self.seleccionado].ruta
+        current_wall   = obtener_fondo_actual()
         ruta_thumbnail = thumb_cache_path(ruta_nueva, THUMBNAIL_SIZE)
-
+ 
         self.destroy()
-
+ 
         threading.Thread(
             target=_sandwich_worker,
             args=(ruta_nueva, current_wall, ruta_thumbnail),
             daemon=True
         ).start()
-
+ 
     def on_tecla(self, widget, event):
         k = event.keyval
         if k == Gdk.KEY_Escape:
@@ -560,7 +645,7 @@ class WallpaperBar(Gtk.Window):
         elif k == Gdk.KEY_Left:
             self.seleccionado = (self.seleccionado - 1) % len(self.items)
             self.actualizar_seleccion()
-
+ 
 if __name__ == "__main__":
     win = WallpaperBar()
     win.show_all()
