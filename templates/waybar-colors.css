@@ -1,0 +1,11 @@
+/*plantilla generada por matugen para manipular los colores de waybar md3*/
+@define-color base {{colors.background.default.hex}};
+@define-color mantle {{colors.surface_variant.default.hex}};
+@define-color surface {{colors.surface.default.hex}};
+@define-color text {{colors.on_surface.default.hex}};
+@define-color primary {{colors.primary.default.hex}};
+@define-color secondary {{colors.secondary.default.hex}};
+@define-color border_active {{colors.primary.default.hex}};
+@define-color border_inactive {{colors.surface_variant.default.hex}};
+
+

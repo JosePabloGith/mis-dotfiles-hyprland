@@ -436,6 +436,13 @@ def _sandwich_worker(ruta_nueva, current_wall, ruta_thumbnail):
             ["hyprctl", "reload"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
+        
+        # implementamos la recarga de waybar, para que se adapte a el nuevo color
+        subprocess.run(
+            ["killall", "-SIGUSR2", "waybar"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
     else:
         if DEBUG_MODE:
             notificar_error("Thumbnail no encontrado. Se omitió la recarga de colores.")
